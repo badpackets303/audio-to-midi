@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include "HarmonicPitchDetector.h"
 #include <vector>
 #include <array>
 
@@ -87,6 +88,7 @@ private:
     juce::dsp::FFT fft;
     juce::dsp::WindowingFunction<float> window;
     std::vector<float> fftData;
+    HarmonicPitchDetector harmonicDetector;
 
     // Audio analysis buffer (circular) + linearized copy for FFT
     juce::AudioBuffer<float> analysisBuffer;
@@ -135,7 +137,6 @@ private:
 
     // Pitch detection methods
     std::vector<std::pair<float, float>> detectPitches(const float* audioData, int numSamples, int maxNotes);
-    float parabolicInterpolation(float leftMag, float centerMag, float rightMag);
     int frequencyToMidiNote(float frequency);
     float midiNoteToFrequency(int midiNote);
     int calculatePitchBend(float currentFrequency, float baseFrequency, float pitchBendRange);

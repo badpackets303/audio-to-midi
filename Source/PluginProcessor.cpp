@@ -262,9 +262,6 @@ std::vector<std::pair<float, float>> AudioToMidiProcessor::detectPitches(const f
     // Perform FFT
     fft.performFrequencyOnlyForwardTransform(fftData.data());
 
-    // Find peaks in the spectrum
-    std::vector<std::pair<float, float>> peaks; // frequency, magnitude
-
     float binResolution = static_cast<float>(currentSampleRate) / fftSize;
 
     // Update visualization bands (log-spaced 60 Hz - 8 kHz, peak magnitude per band,
@@ -289,110 +286,19 @@ std::vector<std::pair<float, float>> AudioToMidiProcessor::detectPitches(const f
             vizBands[(size_t) b].store(juce::jlimit(0.0f, 1.0f, bandPeak * vizNorm));
         }
     }
-    int minBin = static_cast<int>(minFrequency / binResolution);
-    int maxBin = static_cast<int>(maxFrequency / binResolution);
 
-    // Find local maxima in the spectrum
-    float threshold = *parameters.getRawParameterValue("threshold");
-
-    // Find the global maximum once (for relative thresholding)
-    float maxMagnitude = 0.0f;
-    for (int j = minBin; j < maxBin; ++j)
-        maxMagnitude = std::max(maxMagnitude, fftData[j]);
-
-    for (int bin = minBin + 1; bin < maxBin - 1; ++bin)
-    {
-        float magnitude = fftData[bin];
-
-        // Check if this is a local maximum
-        if (magnitude > fftData[bin - 1] && magnitude > fftData[bin + 1])
-        {
-            if (magnitude > threshold * maxMagnitude)
-            {
-                // Use parabolic interpolation for sub-bin accuracy
-                float leftMag = fftData[bin - 1];
-                float centerMag = fftData[bin];
-                float rightMag = fftData[bin + 1];
-
-                float delta = parabolicInterpolation(leftMag, centerMag, rightMag);
-                float interpolatedBin = bin + delta;
-                float frequency = interpolatedBin * binResolution;
-
-                peaks.push_back({frequency, magnitude});
-            }
-        }
-    }
-
-    // Sort peaks by magnitude (strongest first)
-    std::sort(peaks.begin(), peaks.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
-
-    // Harmonic suppression: greedily accept fundamentals, reject peaks that are
-    // integer-multiple harmonics of already-accepted notes or of a plausible
-    // lower fundamental present in the spectrum.
-    constexpr float harmonicToleranceCents = 40.0f;
-
-    auto centsBetween = [](float f1, float f2) {
-        return std::abs(1200.0f * std::log2(f1 / f2));
-    };
-
-    // True if 'candidate' lies near an integer multiple (2x..8x) of 'fundamental'
-    auto isHarmonicOf = [&](float candidate, float fundamental) {
-        for (int h = 2; h <= 8; ++h)
-        {
-            if (centsBetween(candidate, fundamental * (float) h) < harmonicToleranceCents)
-                return true;
-        }
-        return false;
-    };
+    // Pick fundamentals by harmonic pattern rather than raw peak loudness, so a
+    // dominant overtone (e.g. the 4th harmonic of a low string) isn't reported
+    // as the note, and a note's harmonics aren't reported as extra notes.
+    HarmonicPitchDetector::Settings settings;
+    settings.minFrequency      = minFrequency;
+    settings.maxFrequency      = maxFrequency;
+    settings.relativeThreshold = *parameters.getRawParameterValue("threshold");
+    settings.maxNotes          = maxNotes;
 
     std::vector<std::pair<float, float>> result;
-
-    for (const auto& peak : peaks)
-    {
-        if ((int) result.size() >= maxNotes)
-            break;
-
-        // Reject if it's a harmonic of a note we've already accepted
-        bool rejected = false;
-        for (const auto& sel : result)
-        {
-            if (isHarmonicOf(peak.first, sel.first))
-            {
-                rejected = true;
-                break;
-            }
-        }
-        if (rejected)
-            continue;
-
-        // Octave/harmonic-error correction: if the spectrum contains a peak near
-        // 1/2, 1/3 or 1/4 of this frequency with meaningful energy, this peak is
-        // almost certainly a harmonic of that lower note - skip it and let the
-        // true fundamental be accepted on its own merits.
-        for (const auto& other : peaks)
-        {
-            if (other.first >= peak.first)
-                continue;
-
-            for (int div = 2; div <= 4; ++div)
-            {
-                if (centsBetween(other.first * (float) div, peak.first) < harmonicToleranceCents
-                    && other.second > peak.second * 0.25f)
-                {
-                    rejected = true;
-                    break;
-                }
-            }
-            if (rejected)
-                break;
-        }
-        if (rejected)
-            continue;
-
-        result.push_back(peak);
-    }
+    for (const auto& pitch : harmonicDetector.process(fftData.data(), fftSize / 2 + 1, binResolution, settings))
+        result.push_back({ pitch.frequency, pitch.magnitude });
 
     return result;
 }
@@ -729,16 +635,6 @@ void AudioToMidiProcessor::flushAllNotes(juce::MidiBuffer& midiMessages)
     }
 
     midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, 8192), 0);
-}
-
-float AudioToMidiProcessor::parabolicInterpolation(float leftMag, float centerMag, float rightMag)
-{
-    // Parabolic interpolation to find the true peak between bins
-    // Returns the offset from the center bin (-0.5 to +0.5)
-    float delta = 0.5f * (leftMag - rightMag) / (leftMag - 2.0f * centerMag + rightMag);
-
-    // Clamp to reasonable range (in case of numerical issues)
-    return juce::jlimit(-0.5f, 0.5f, delta);
 }
 
 int AudioToMidiProcessor::frequencyToMidiNote(float frequency)

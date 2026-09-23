@@ -51,3 +51,12 @@ target_link_libraries(AudioToMidi
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
+
+# Pitch detector unit tests (no JUCE dependency): ctest --test-dir build
+option(AUDIOTOMIDI_BUILD_TESTS "Build the pitch detector unit tests" ON)
+if(AUDIOTOMIDI_BUILD_TESTS)
+    enable_testing()
+    add_executable(PitchDetectorTests tests/PitchDetectorTests.cpp)
+    target_include_directories(PitchDetectorTests PRIVATE Source)
+    add_test(NAME PitchDetectorTests COMMAND PitchDetectorTests)
+endif()
