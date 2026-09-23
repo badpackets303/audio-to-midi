@@ -94,7 +94,8 @@ AudioToMidiProcessorEditor::AudioToMidiProcessorEditor (AudioToMidiProcessor& p)
     pitchBendRangeAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
         audioProcessor.parameters, "pitchBendRange", pitchBendRangeSlider);
 
-    setSize (520, 656);
+    // Tall enough for the MIDI output panel to list all maxPolyphony (6) notes
+    setSize (520, 710);
 }
 
 AudioToMidiProcessorEditor::~AudioToMidiProcessorEditor()
