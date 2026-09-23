@@ -1,0 +1,14 @@
+# Build output
+build/
+build */
+cmake-build-*/
+PluginBuilds/
+
+# macOS / editors
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Local Claude Code settings
+.claude/settings.local*.json

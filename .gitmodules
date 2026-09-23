@@ -1,0 +1,6 @@
+[submodule "JUCE"]
+	path = JUCE
+	url = https://github.com/juce-framework/JUCE.git
+[submodule "external/q"]
+	path = external/q
+	url = https://github.com/cycfi/q.git
