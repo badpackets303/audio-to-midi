@@ -1,4 +1,4 @@
-// End-to-end tests for AudioToMidiProcessor's MIDI output (poly FFT engine).
+// End-to-end tests for AudioToMidiProcessor's MIDI output.
 //
 // Feeds synthesized, slightly detuned guitar-like audio through processBlock()
 // and checks the resulting MIDI stream. Pitch bend is channel-wide, so it must
@@ -24,6 +24,7 @@ struct Tone
     double detuneCents;
     double startSeconds;
     double endSeconds;
+    double vibratoCents = 0.0;  // depth of a slow (4 Hz) pitch wobble
 };
 
 struct TimedEvent
@@ -33,12 +34,13 @@ struct TimedEvent
 };
 
 // Renders the tones block by block through the processor and returns every MIDI event
-std::vector<TimedEvent> runProcessor(const std::vector<Tone>& tones, double lengthSeconds, bool pitchBend)
+std::vector<TimedEvent> runProcessor(const std::vector<Tone>& tones, double lengthSeconds, bool pitchBend,
+                                     int maxPolyphony = 4)
 {
     AudioToMidiProcessor processor;
     processor.parameters.getParameter("enablePitchBend")->setValueNotifyingHost(pitchBend ? 1.0f : 0.0f);
     processor.parameters.getParameter("maxPolyphony")->setValueNotifyingHost(
-        processor.parameters.getParameter("maxPolyphony")->convertTo0to1(4.0f));
+        processor.parameters.getParameter("maxPolyphony")->convertTo0to1((float) maxPolyphony));
     processor.prepareToPlay(sampleRate, blockSize);
 
     const std::vector<double> harmonics { 1.0, 0.8, 0.6, 0.5, 0.3, 0.2, 0.15, 0.1, 0.07, 0.05 };
@@ -47,6 +49,7 @@ std::vector<TimedEvent> runProcessor(const std::vector<Tone>& tones, double leng
     juce::AudioBuffer<float> buffer(2, blockSize);
     juce::MidiBuffer midi;
     std::vector<TimedEvent> events;
+    std::vector<double> phases(tones.size() * harmonics.size(), 0.0);
 
     for (int64_t blockStart = 0; blockStart < totalSamples; blockStart += blockSize)
     {
@@ -55,13 +58,20 @@ std::vector<TimedEvent> runProcessor(const std::vector<Tone>& tones, double leng
         {
             const double t = (double) (blockStart + i) / sampleRate;
             double x = 0.0;
-            for (const auto& tone : tones)
+            for (size_t n = 0; n < tones.size(); ++n)
             {
+                const auto& tone = tones[n];
                 if (t < tone.startSeconds || t >= tone.endSeconds)
                     continue;
-                const double f0 = 440.0 * std::pow(2.0, (tone.midiNote - 69 + tone.detuneCents / 100.0) / 12.0);
+                const double cents = tone.detuneCents + tone.vibratoCents * std::sin(2.0 * pi * 4.0 * t);
+                const double f0 = 440.0 * std::pow(2.0, (tone.midiNote - 69 + cents / 100.0) / 12.0);
                 for (size_t k = 0; k < harmonics.size(); ++k)
-                    x += 0.05 * harmonics[k] * std::sin(2.0 * pi * f0 * (double) (k + 1) * t + (double) k);
+                {
+                    // Integrate phase so the pitch can change smoothly
+                    auto& phase = phases[n * harmonics.size() + k];
+                    phase += 2.0 * pi * f0 * (double) (k + 1) / sampleRate;
+                    x += 0.05 * harmonics[k] * std::sin(phase + (double) k);
+                }
             }
             buffer.setSample(0, i, (float) x);
         }
@@ -120,6 +130,14 @@ bool bendCenteredDuringChords(const std::vector<TimedEvent>& events, bool verbos
     return true;
 }
 
+int countNoteOns(const std::vector<TimedEvent>& events)
+{
+    int count = 0;
+    for (const auto& e : events)
+        count += e.message.isNoteOn() ? 1 : 0;
+    return count;
+}
+
 std::set<int> notesPlayed(const std::vector<TimedEvent>& events)
 {
     std::set<int> notes;
@@ -134,7 +152,7 @@ int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
 
-    const int A2 = 45, C3 = 48, E3 = 52, G3 = 55;
+    const int D2 = 38, A2 = 45, C3 = 48, E3 = 52, G3 = 55;
 
     // 1. Single detuned note: bend is sent before the note-on and matches the detune
     {
@@ -199,6 +217,33 @@ int main()
         for (const auto& e : events)
             anyBend |= e.message.isPitchWheel() && e.message.getPitchWheelValue() != 8192;
         check(! anyBend, "no pitch bend sent");
+    }
+
+    // 5. Out-of-tune note wobbling across the halfway point between A2 and A#2
+    //    must stay one note (hysteresis) in both engines, not retrigger
+    for (int polyphony : { 4, 1 })
+    {
+        std::printf("A2 +45 cents with +/-15 cent vibrato, polyphony %d\n", polyphony);
+        Tone tone { A2, 45.0, 0.0, 2.5 };
+        tone.vibratoCents = 15.0;
+        const auto events = runProcessor({ tone }, 3.0, true, polyphony);
+        std::printf("     %d note-on(s)\n", countNoteOns(events));
+        check(countNoteOns(events) == 1, "a single note-on");
+    }
+
+    // 6. A real one-semitone step must still register as a new note
+    for (int polyphony : { 4, 1 })
+    {
+        std::printf("A2 then A#2 (semitone step at 1 s), polyphony %d\n", polyphony);
+        const auto events = runProcessor({ { A2, 0.0, 0.0, 1.0 }, { A2 + 1, 0.0, 1.0, 2.0 } }, 2.5, true, polyphony);
+        check(notesPlayed(events) == std::set<int> { A2, A2 + 1 }, "plays A2 then A#2");
+    }
+
+    // 7. Drop-D low string
+    {
+        std::printf("D2 (drop D)\n");
+        const auto events = runProcessor({ { D2, 0.0, 0.0, 1.5 } }, 2.0, true);
+        check(notesPlayed(events) == std::set<int> { D2 }, "plays only D2");
     }
 
     std::printf("\n%s\n", failures == 0 ? "All processor tests passed" : "Processor tests FAILED");

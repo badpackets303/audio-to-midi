@@ -75,7 +75,9 @@ private:
     // Pitch detection parameters
     static constexpr int fftOrder = 12;  // 2^12 = 4096 samples
     static constexpr int fftSize = 1 << fftOrder;
-    static constexpr float minFrequency = 80.0f;    // E2 - lowest guitar string
+    // Lowest fundamental: D2 (73.4 Hz) for drop-D tuning. Going lower (drop C, C2)
+    // lets a C3-E3-G3 triad be mistaken for C2 with a missing fundamental.
+    static constexpr float minFrequency = 70.0f;
     static constexpr float maxFrequency = 1200.0f;  // Roughly 3 octaves above
 
     // Overlapped analysis: full window re-analyzed every hopSize samples
@@ -83,6 +85,11 @@ private:
 
     // Temporal onset gating: consecutive frames a pitch must persist before note-on
     static constexpr int onsetFramesRequired = 3;
+
+    // A sounding note is kept until the pitch moves this far from it (rather than
+    // the 0.5 semitone rounding boundary), so an out-of-tune or wobbling string
+    // doesn't flip between neighbouring notes. Pitch bend still tracks the real pitch.
+    static constexpr float noteHysteresisSemitones = 0.75f;
 
     // FFT
     juce::dsp::FFT fft;
@@ -138,6 +145,7 @@ private:
     // Pitch detection methods
     std::vector<std::pair<float, float>> detectPitches(const float* audioData, int numSamples, int maxNotes);
     int frequencyToMidiNote(float frequency);
+    static bool isNearNote(float frequency, float noteFrequency);
     float midiNoteToFrequency(int midiNote);
     int calculatePitchBend(float currentFrequency, float baseFrequency, float pitchBendRange);
     void updateActiveNotes(const std::vector<std::pair<float, float>>& detectedPitches, juce::MidiBuffer& midiMessages, int samplePosition);

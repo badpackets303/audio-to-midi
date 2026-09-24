@@ -325,8 +325,20 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
 
     for (const auto& pitch : detectedPitches)
     {
+        // Keep an already-sounding note while the pitch stays near it
         int midiNote = frequencyToMidiNote(pitch.first);
-        if (midiNote >= 0 && midiNote <= 127)
+        for (const auto& note : activeNotes)
+        {
+            if (note.midiNote >= 0 && isNearNote(pitch.first, note.baseFrequency))
+            {
+                midiNote = note.midiNote;
+                break;
+            }
+        }
+
+        const bool duplicate = std::find(detectedMidiNotes.begin(), detectedMidiNotes.end(), midiNote)
+                                   != detectedMidiNotes.end();
+        if (midiNote >= 0 && midiNote <= 127 && ! duplicate)
         {
             detectedMidiNotes.push_back(midiNote);
             detectedFrequencies.push_back(pitch.first);
@@ -512,6 +524,11 @@ void AudioToMidiProcessor::monoHandleEstimate(float frequency, float envelope,
                                               juce::MidiBuffer& midiMessages, int samplePosition)
 {
     int note = frequencyToMidiNote(frequency);
+
+    // Keep the sounding note while the pitch stays near it
+    if (monoCurrentNote >= 0 && isNearNote(frequency, monoBaseFrequency))
+        note = monoCurrentNote;
+
     if (note < 0 || note > 127)
         return;
 
@@ -665,6 +682,14 @@ int AudioToMidiProcessor::frequencyToMidiNote(float frequency)
 
     // Round to nearest MIDI note
     return static_cast<int>(std::round(midiNoteFloat));
+}
+
+bool AudioToMidiProcessor::isNearNote(float frequency, float noteFrequency)
+{
+    if (frequency <= 0.0f || noteFrequency <= 0.0f)
+        return false;
+
+    return std::abs(12.0f * std::log2(frequency / noteFrequency)) < noteHysteresisSemitones;
 }
 
 float AudioToMidiProcessor::midiNoteToFrequency(int midiNote)

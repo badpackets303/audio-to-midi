@@ -24,7 +24,7 @@ class HarmonicPitchDetector
 public:
     struct Settings
     {
-        float minFrequency      = 80.0f;   // lowest fundamental considered
+        float minFrequency      = 70.0f;   // lowest fundamental considered (D2 = 73.4 Hz, drop D)
         float maxFrequency      = 1200.0f; // highest fundamental considered
         float relativeThreshold = 0.3f;    // extra notes need this fraction of the strongest note's score
         int   maxNotes          = 4;

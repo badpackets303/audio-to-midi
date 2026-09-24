@@ -177,11 +177,13 @@ void runQuiet(const TestCase& tc, double sampleRate)
 
 int main()
 {
-    const int E2 = 40, F2 = 41, A2 = 45, B2 = 47, C3 = 48, D3 = 50, E3 = 52, G3 = 55,
+    const int D2 = 38, E2 = 40, F2 = 41, A2 = 45, B2 = 47, C3 = 48, D3 = 50, E3 = 52, G3 = 55,
               B3 = 59, Cs4 = 61, E4 = 64, G4 = 67, E5 = 76, A5 = 81, D6 = 86;
 
     const std::vector<TestCase> cases {
         // Single notes, polyphony 4: harmonics must not be reported as extra notes
+        { "D2 strong fundamental (drop D)",       { { D2, strongFundamental } },  4 },
+        { "D2 weak fundamental (drop D)",         { { D2, weakFundamental } },    4 },
         { "E2 strong fundamental",                { { E2, strongFundamental } },  4 },
         { "E2 weak fundamental (was B3 G#4 E3)",  { { E2, weakFundamental } },    4 },
         { "E2 very weak fundamental (was E4 ...)",{ { E2, veryWeakFund } },       4 },
@@ -219,11 +221,11 @@ int main()
         for (const auto& tc : cases)
             run(tc, sr);
 
-    // Every semitone across the guitar's range, with every harmonic profile.
+    // Every semitone across the guitar's range (drop D to the 22nd fret), with every harmonic profile.
     // Only failures are printed.
     const int passedBeforeSweep = total - failures;
     for (double sr : { 44100.0, 48000.0 })
-        for (int note = E2; note <= D6; ++note)
+        for (int note = D2; note <= D6; ++note)
             for (const auto* profile : { &strongFundamental, &weakFundamental, &veryWeakFund,
                                          &missingFundamental, &brightHighString })
                 runQuiet({ "sweep " + noteName(note), { { note, *profile } }, 4 }, sr);
