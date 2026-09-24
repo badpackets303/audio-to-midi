@@ -51,3 +51,38 @@ target_link_libraries(AudioToMidi
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
+
+# Pitch detector unit tests (no JUCE dependency): ctest --test-dir build
+option(AUDIOTOMIDI_BUILD_TESTS "Build the pitch detector unit tests" ON)
+if(AUDIOTOMIDI_BUILD_TESTS)
+    enable_testing()
+    add_executable(PitchDetectorTests tests/PitchDetectorTests.cpp)
+    target_include_directories(PitchDetectorTests PRIVATE Source)
+    add_test(NAME PitchDetectorTests COMMAND PitchDetectorTests)
+
+    # End-to-end MIDI output tests: builds the processor into a console app
+    juce_add_console_app(ProcessorTests PRODUCT_NAME "ProcessorTests")
+    juce_generate_juce_header(ProcessorTests)
+    target_sources(ProcessorTests
+        PRIVATE
+            tests/ProcessorTests.cpp
+            Source/PluginProcessor.cpp
+            Source/PluginEditor.cpp)
+    target_include_directories(ProcessorTests PRIVATE Source)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/q/q_lib/include")
+        target_include_directories(ProcessorTests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/external/q/q_lib/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/external/q/infra/include")
+    endif()
+    target_compile_definitions(ProcessorTests
+        PRIVATE
+            JucePlugin_Name="Audio To MIDI"
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0)
+    target_link_libraries(ProcessorTests
+        PRIVATE
+            juce::juce_audio_utils
+            juce::juce_dsp
+            juce::juce_recommended_config_flags)
+    add_test(NAME ProcessorTests COMMAND ProcessorTests)
+endif()

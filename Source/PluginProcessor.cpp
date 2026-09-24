@@ -87,6 +87,7 @@ void AudioToMidiProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     activeNotes.clear();
     activeNotes.resize(maxPolyphony);
     noteCandidateFrames.fill(0);
+    polyLastBend = 8192;
 
     // Initialize mono tracking
 #if defined(HAVE_CYCFI_Q)
@@ -262,9 +263,6 @@ std::vector<std::pair<float, float>> AudioToMidiProcessor::detectPitches(const f
     // Perform FFT
     fft.performFrequencyOnlyForwardTransform(fftData.data());
 
-    // Find peaks in the spectrum
-    std::vector<std::pair<float, float>> peaks; // frequency, magnitude
-
     float binResolution = static_cast<float>(currentSampleRate) / fftSize;
 
     // Update visualization bands (log-spaced 60 Hz - 8 kHz, peak magnitude per band,
@@ -289,110 +287,19 @@ std::vector<std::pair<float, float>> AudioToMidiProcessor::detectPitches(const f
             vizBands[(size_t) b].store(juce::jlimit(0.0f, 1.0f, bandPeak * vizNorm));
         }
     }
-    int minBin = static_cast<int>(minFrequency / binResolution);
-    int maxBin = static_cast<int>(maxFrequency / binResolution);
 
-    // Find local maxima in the spectrum
-    float threshold = *parameters.getRawParameterValue("threshold");
-
-    // Find the global maximum once (for relative thresholding)
-    float maxMagnitude = 0.0f;
-    for (int j = minBin; j < maxBin; ++j)
-        maxMagnitude = std::max(maxMagnitude, fftData[j]);
-
-    for (int bin = minBin + 1; bin < maxBin - 1; ++bin)
-    {
-        float magnitude = fftData[bin];
-
-        // Check if this is a local maximum
-        if (magnitude > fftData[bin - 1] && magnitude > fftData[bin + 1])
-        {
-            if (magnitude > threshold * maxMagnitude)
-            {
-                // Use parabolic interpolation for sub-bin accuracy
-                float leftMag = fftData[bin - 1];
-                float centerMag = fftData[bin];
-                float rightMag = fftData[bin + 1];
-
-                float delta = parabolicInterpolation(leftMag, centerMag, rightMag);
-                float interpolatedBin = bin + delta;
-                float frequency = interpolatedBin * binResolution;
-
-                peaks.push_back({frequency, magnitude});
-            }
-        }
-    }
-
-    // Sort peaks by magnitude (strongest first)
-    std::sort(peaks.begin(), peaks.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
-
-    // Harmonic suppression: greedily accept fundamentals, reject peaks that are
-    // integer-multiple harmonics of already-accepted notes or of a plausible
-    // lower fundamental present in the spectrum.
-    constexpr float harmonicToleranceCents = 40.0f;
-
-    auto centsBetween = [](float f1, float f2) {
-        return std::abs(1200.0f * std::log2(f1 / f2));
-    };
-
-    // True if 'candidate' lies near an integer multiple (2x..8x) of 'fundamental'
-    auto isHarmonicOf = [&](float candidate, float fundamental) {
-        for (int h = 2; h <= 8; ++h)
-        {
-            if (centsBetween(candidate, fundamental * (float) h) < harmonicToleranceCents)
-                return true;
-        }
-        return false;
-    };
+    // Pick fundamentals by harmonic pattern rather than raw peak loudness, so a
+    // dominant overtone (e.g. the 4th harmonic of a low string) isn't reported
+    // as the note, and a note's harmonics aren't reported as extra notes.
+    HarmonicPitchDetector::Settings settings;
+    settings.minFrequency      = minFrequency;
+    settings.maxFrequency      = maxFrequency;
+    settings.relativeThreshold = *parameters.getRawParameterValue("threshold");
+    settings.maxNotes          = maxNotes;
 
     std::vector<std::pair<float, float>> result;
-
-    for (const auto& peak : peaks)
-    {
-        if ((int) result.size() >= maxNotes)
-            break;
-
-        // Reject if it's a harmonic of a note we've already accepted
-        bool rejected = false;
-        for (const auto& sel : result)
-        {
-            if (isHarmonicOf(peak.first, sel.first))
-            {
-                rejected = true;
-                break;
-            }
-        }
-        if (rejected)
-            continue;
-
-        // Octave/harmonic-error correction: if the spectrum contains a peak near
-        // 1/2, 1/3 or 1/4 of this frequency with meaningful energy, this peak is
-        // almost certainly a harmonic of that lower note - skip it and let the
-        // true fundamental be accepted on its own merits.
-        for (const auto& other : peaks)
-        {
-            if (other.first >= peak.first)
-                continue;
-
-            for (int div = 2; div <= 4; ++div)
-            {
-                if (centsBetween(other.first * (float) div, peak.first) < harmonicToleranceCents
-                    && other.second > peak.second * 0.25f)
-                {
-                    rejected = true;
-                    break;
-                }
-            }
-            if (rejected)
-                break;
-        }
-        if (rejected)
-            continue;
-
-        result.push_back(peak);
-    }
+    for (const auto& pitch : harmonicDetector.process(fftData.data(), fftSize / 2 + 1, binResolution, settings))
+        result.push_back({ pitch.frequency, pitch.magnitude });
 
     return result;
 }
@@ -418,8 +325,20 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
 
     for (const auto& pitch : detectedPitches)
     {
+        // Keep an already-sounding note while the pitch stays near it
         int midiNote = frequencyToMidiNote(pitch.first);
-        if (midiNote >= 0 && midiNote <= 127)
+        for (const auto& note : activeNotes)
+        {
+            if (note.midiNote >= 0 && isNearNote(pitch.first, note.baseFrequency))
+            {
+                midiNote = note.midiNote;
+                break;
+            }
+        }
+
+        const bool duplicate = std::find(detectedMidiNotes.begin(), detectedMidiNotes.end(), midiNote)
+                                   != detectedMidiNotes.end();
+        if (midiNote >= 0 && midiNote <= 127 && ! duplicate)
         {
             detectedMidiNotes.push_back(midiNote);
             detectedFrequencies.push_back(pitch.first);
@@ -460,25 +379,6 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                 int index = std::distance(detectedMidiNotes.begin(), it);
                 note.amplitude = detectedAmplitudes[index];
                 note.currentFrequency = detectedFrequencies[index];
-
-                // Calculate and send pitch bend if enabled and frequency has changed
-                if (enablePitchBend)
-                {
-                    int newPitchBend = calculatePitchBend(note.currentFrequency, note.baseFrequency, pitchBendRange);
-
-                    // Only send pitch bend if it has changed significantly (avoid jitter)
-                    if (std::abs(newPitchBend - note.lastPitchBend) > 20)
-                    {
-                        midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, newPitchBend), samplePosition);
-                        note.lastPitchBend = newPitchBend;
-                    }
-                }
-                else if (note.lastPitchBend != 8192)
-                {
-                    // Reset pitch bend to center if disabled and not already at center
-                    midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, 8192), samplePosition);
-                    note.lastPitchBend = 8192;
-                }
             }
             else
             {
@@ -509,13 +409,17 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                     note.baseFrequency = 0.0f;
                     note.currentFrequency = 0.0f;
                     note.amplitude = 0.0f;
-                    note.lastPitchBend = 8192;
                 }
             }
         }
     }
 
-    // Add newly detected notes (only once they've persisted long enough)
+    // Add newly detected notes (only once they've persisted long enough).
+    // Slots are claimed here; the note-ons are sent after the pitch bend below.
+    struct PendingNoteOn { size_t slot; int velocity; };
+    std::array<PendingNoteOn, maxPolyphony> pendingNoteOns;
+    size_t numPendingNoteOns = 0;
+
     for (size_t i = 0; i < detectedMidiNotes.size(); ++i)
     {
         int midiNote = detectedMidiNotes[i];
@@ -548,7 +452,6 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                     note.currentFrequency = detectedFrequencies[i];
                     note.amplitude = detectedAmplitudes[i];
                     note.framesSinceDetection = 0;
-                    note.lastPitchBend = 8192; // Reset pitch bend to center
 
                     // Calculate velocity based on amplitude and sensitivity
                     // Amplitude is normalized (0-1), apply power curve for natural response
@@ -557,15 +460,7 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
 
                     // Map to MIDI velocity range (1-127)
                     int velocity = static_cast<int>(juce::jlimit(1.0f, 127.0f, normalizedVelocity * 127.0f));
-                    midiMessages.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8)velocity), samplePosition);
-
-                    // Send initial pitch bend for the starting frequency (if enabled)
-                    if (enablePitchBend)
-                    {
-                        int initialPitchBend = calculatePitchBend(note.currentFrequency, note.baseFrequency, pitchBendRange);
-                        midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, initialPitchBend), samplePosition);
-                        note.lastPitchBend = initialPitchBend;
-                    }
+                    pendingNoteOns[numPendingNoteOns++] = { noteIdx, velocity };
 
                     // Update UI tracking
                     {
@@ -583,12 +478,57 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
             }
         }
     }
+
+    // Pitch bend is channel-wide: every sounding note on channel 1 bends with
+    // it. Only follow the detected pitch while exactly one note sounds; with a
+    // chord, hold it at center so one note's bend doesn't detune the others.
+    // With no notes sounding leave it alone, so a synth's release tail doesn't jump.
+    {
+        const ActiveNote* soundingNote = nullptr;
+        int numSounding = 0;
+        for (const auto& note : activeNotes)
+        {
+            if (note.midiNote >= 0)
+            {
+                soundingNote = &note;
+                ++numSounding;
+            }
+        }
+
+        int targetBend = polyLastBend;
+        if (! enablePitchBend || numSounding > 1)
+            targetBend = 8192;
+        else if (numSounding == 1)
+            targetBend = calculatePitchBend(soundingNote->currentFrequency, soundingNote->baseFrequency, pitchBendRange);
+
+        // A new note must start at the right pitch, so always send before its note-on;
+        // otherwise skip tiny changes to avoid jitter.
+        const bool changed = targetBend == 8192 ? polyLastBend != 8192
+                                                : std::abs(targetBend - polyLastBend) > 20;
+        if (targetBend != polyLastBend && (changed || numPendingNoteOns > 0))
+        {
+            midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, targetBend), samplePosition);
+            polyLastBend = targetBend;
+        }
+    }
+
+    for (size_t p = 0; p < numPendingNoteOns; ++p)
+    {
+        const auto& pending = pendingNoteOns[p];
+        const auto& note = activeNotes[pending.slot];
+        midiMessages.addEvent(juce::MidiMessage::noteOn(1, note.midiNote, (juce::uint8) pending.velocity), samplePosition);
+    }
 }
 
 void AudioToMidiProcessor::monoHandleEstimate(float frequency, float envelope,
                                               juce::MidiBuffer& midiMessages, int samplePosition)
 {
     int note = frequencyToMidiNote(frequency);
+
+    // Keep the sounding note while the pitch stays near it
+    if (monoCurrentNote >= 0 && isNearNote(frequency, monoBaseFrequency))
+        note = monoCurrentNote;
+
     if (note < 0 || note > 127)
         return;
 
@@ -656,14 +596,15 @@ void AudioToMidiProcessor::monoNoteOn(int midiNote, float frequency, float envel
     monoBaseFrequency = midiNoteToFrequency(midiNote);
     monoLastBend      = 8192;
 
-    midiMessages.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8) velocity), samplePosition);
-
+    // Bend first so the note starts at the detected pitch
     if (enablePitchBend)
     {
         int initialBend = calculatePitchBend(frequency, monoBaseFrequency, pitchBendRange);
         midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, initialBend), samplePosition);
         monoLastBend = initialBend;
     }
+
+    midiMessages.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8) velocity), samplePosition);
 
     {
         juce::ScopedLock lock(midiNoteLock);
@@ -711,6 +652,7 @@ void AudioToMidiProcessor::flushAllNotes(juce::MidiBuffer& midiMessages)
         }
     }
     noteCandidateFrames.fill(0);
+    polyLastBend = 8192;
 
     // Mono engine note
     monoNoteOff(midiMessages, 0);
@@ -731,16 +673,6 @@ void AudioToMidiProcessor::flushAllNotes(juce::MidiBuffer& midiMessages)
     midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, 8192), 0);
 }
 
-float AudioToMidiProcessor::parabolicInterpolation(float leftMag, float centerMag, float rightMag)
-{
-    // Parabolic interpolation to find the true peak between bins
-    // Returns the offset from the center bin (-0.5 to +0.5)
-    float delta = 0.5f * (leftMag - rightMag) / (leftMag - 2.0f * centerMag + rightMag);
-
-    // Clamp to reasonable range (in case of numerical issues)
-    return juce::jlimit(-0.5f, 0.5f, delta);
-}
-
 int AudioToMidiProcessor::frequencyToMidiNote(float frequency)
 {
     if (frequency <= 0.0f) return -1;
@@ -750,6 +682,14 @@ int AudioToMidiProcessor::frequencyToMidiNote(float frequency)
 
     // Round to nearest MIDI note
     return static_cast<int>(std::round(midiNoteFloat));
+}
+
+bool AudioToMidiProcessor::isNearNote(float frequency, float noteFrequency)
+{
+    if (frequency <= 0.0f || noteFrequency <= 0.0f)
+        return false;
+
+    return std::abs(12.0f * std::log2(frequency / noteFrequency)) < noteHysteresisSemitones;
 }
 
 float AudioToMidiProcessor::midiNoteToFrequency(int midiNote)
