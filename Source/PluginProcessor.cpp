@@ -87,6 +87,7 @@ void AudioToMidiProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     activeNotes.clear();
     activeNotes.resize(maxPolyphony);
     noteCandidateFrames.fill(0);
+    polyLastBend = 8192;
 
     // Initialize mono tracking
 #if defined(HAVE_CYCFI_Q)
@@ -366,25 +367,6 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                 int index = std::distance(detectedMidiNotes.begin(), it);
                 note.amplitude = detectedAmplitudes[index];
                 note.currentFrequency = detectedFrequencies[index];
-
-                // Calculate and send pitch bend if enabled and frequency has changed
-                if (enablePitchBend)
-                {
-                    int newPitchBend = calculatePitchBend(note.currentFrequency, note.baseFrequency, pitchBendRange);
-
-                    // Only send pitch bend if it has changed significantly (avoid jitter)
-                    if (std::abs(newPitchBend - note.lastPitchBend) > 20)
-                    {
-                        midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, newPitchBend), samplePosition);
-                        note.lastPitchBend = newPitchBend;
-                    }
-                }
-                else if (note.lastPitchBend != 8192)
-                {
-                    // Reset pitch bend to center if disabled and not already at center
-                    midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, 8192), samplePosition);
-                    note.lastPitchBend = 8192;
-                }
             }
             else
             {
@@ -415,13 +397,17 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                     note.baseFrequency = 0.0f;
                     note.currentFrequency = 0.0f;
                     note.amplitude = 0.0f;
-                    note.lastPitchBend = 8192;
                 }
             }
         }
     }
 
-    // Add newly detected notes (only once they've persisted long enough)
+    // Add newly detected notes (only once they've persisted long enough).
+    // Slots are claimed here; the note-ons are sent after the pitch bend below.
+    struct PendingNoteOn { size_t slot; int velocity; };
+    std::array<PendingNoteOn, maxPolyphony> pendingNoteOns;
+    size_t numPendingNoteOns = 0;
+
     for (size_t i = 0; i < detectedMidiNotes.size(); ++i)
     {
         int midiNote = detectedMidiNotes[i];
@@ -454,7 +440,6 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                     note.currentFrequency = detectedFrequencies[i];
                     note.amplitude = detectedAmplitudes[i];
                     note.framesSinceDetection = 0;
-                    note.lastPitchBend = 8192; // Reset pitch bend to center
 
                     // Calculate velocity based on amplitude and sensitivity
                     // Amplitude is normalized (0-1), apply power curve for natural response
@@ -463,15 +448,7 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
 
                     // Map to MIDI velocity range (1-127)
                     int velocity = static_cast<int>(juce::jlimit(1.0f, 127.0f, normalizedVelocity * 127.0f));
-                    midiMessages.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8)velocity), samplePosition);
-
-                    // Send initial pitch bend for the starting frequency (if enabled)
-                    if (enablePitchBend)
-                    {
-                        int initialPitchBend = calculatePitchBend(note.currentFrequency, note.baseFrequency, pitchBendRange);
-                        midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, initialPitchBend), samplePosition);
-                        note.lastPitchBend = initialPitchBend;
-                    }
+                    pendingNoteOns[numPendingNoteOns++] = { noteIdx, velocity };
 
                     // Update UI tracking
                     {
@@ -488,6 +465,46 @@ void AudioToMidiProcessor::updateActiveNotes(const std::vector<std::pair<float, 
                 }
             }
         }
+    }
+
+    // Pitch bend is channel-wide: every sounding note on channel 1 bends with
+    // it. Only follow the detected pitch while exactly one note sounds; with a
+    // chord, hold it at center so one note's bend doesn't detune the others.
+    // With no notes sounding leave it alone, so a synth's release tail doesn't jump.
+    {
+        const ActiveNote* soundingNote = nullptr;
+        int numSounding = 0;
+        for (const auto& note : activeNotes)
+        {
+            if (note.midiNote >= 0)
+            {
+                soundingNote = &note;
+                ++numSounding;
+            }
+        }
+
+        int targetBend = polyLastBend;
+        if (! enablePitchBend || numSounding > 1)
+            targetBend = 8192;
+        else if (numSounding == 1)
+            targetBend = calculatePitchBend(soundingNote->currentFrequency, soundingNote->baseFrequency, pitchBendRange);
+
+        // A new note must start at the right pitch, so always send before its note-on;
+        // otherwise skip tiny changes to avoid jitter.
+        const bool changed = targetBend == 8192 ? polyLastBend != 8192
+                                                : std::abs(targetBend - polyLastBend) > 20;
+        if (targetBend != polyLastBend && (changed || numPendingNoteOns > 0))
+        {
+            midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, targetBend), samplePosition);
+            polyLastBend = targetBend;
+        }
+    }
+
+    for (size_t p = 0; p < numPendingNoteOns; ++p)
+    {
+        const auto& pending = pendingNoteOns[p];
+        const auto& note = activeNotes[pending.slot];
+        midiMessages.addEvent(juce::MidiMessage::noteOn(1, note.midiNote, (juce::uint8) pending.velocity), samplePosition);
     }
 }
 
@@ -562,14 +579,15 @@ void AudioToMidiProcessor::monoNoteOn(int midiNote, float frequency, float envel
     monoBaseFrequency = midiNoteToFrequency(midiNote);
     monoLastBend      = 8192;
 
-    midiMessages.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8) velocity), samplePosition);
-
+    // Bend first so the note starts at the detected pitch
     if (enablePitchBend)
     {
         int initialBend = calculatePitchBend(frequency, monoBaseFrequency, pitchBendRange);
         midiMessages.addEvent(juce::MidiMessage::pitchWheel(1, initialBend), samplePosition);
         monoLastBend = initialBend;
     }
+
+    midiMessages.addEvent(juce::MidiMessage::noteOn(1, midiNote, (juce::uint8) velocity), samplePosition);
 
     {
         juce::ScopedLock lock(midiNoteLock);
@@ -617,6 +635,7 @@ void AudioToMidiProcessor::flushAllNotes(juce::MidiBuffer& midiMessages)
         }
     }
     noteCandidateFrames.fill(0);
+    polyLastBend = 8192;
 
     // Mono engine note
     monoNoteOff(midiMessages, 0);

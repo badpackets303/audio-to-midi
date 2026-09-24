@@ -106,9 +106,9 @@ private:
         float currentFrequency = 0.0f;   // Current detected frequency
         float amplitude = 0.0f;
         int framesSinceDetection = 0;
-        int lastPitchBend = 8192;        // Last sent pitch bend value (8192 = center/no bend)
     };
     std::vector<ActiveNote> activeNotes;
+    int polyLastBend = 8192;             // Last pitch bend sent on channel 1 (8192 = center)
     static constexpr int maxFramesSilence = 10; // Frames before note off
 
     // Mono tracking (Cycfi Q) --------------------------------------------
